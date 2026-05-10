@@ -1,0 +1,153 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Phase 3: Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- USERS ---
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isOwner(userId) && (
+        (incoming().diff(existing()).affectedKeys().hasOnly(['id', 'name', 'email', 'companyName', 'website', 'tagline', 'location', 'employeeCount', 'foundationYear', 'description', 'sectors', 'sector', 'capacities', 'searchQuery', 'allianceType', 'certificates', 'avatarUrl', 'openRouterKey', 'blockedUsers', 'isPremium', 'services', 'budget', 'aiMatchingEnabled', 'autoDeleteMessages', 'bio', 'visibility', 'themeColor', 'recoveryEmail', 'notificationsEnabled', 'emailAlertsEnabled']))
+      ) && isValidUser(incoming());
+
+      function isValidUser(user) {
+        return user.keys().hasAll(['id', 'name', 'email']) &&
+               user.id is string && user.id == userId &&
+               user.name is string && user.name.size() <= 100 &&
+               user.email is string && user.email.size() <= 100 &&
+               (user.get('bio', '') is string && user.get('bio', '').size() <= 5000) &&
+               (user.get('visibility', 'public') in ['public', 'connections', 'private']) &&
+               (user.get('budget', 0) is number) &&
+               (user.get('isPremium', false) is bool) &&
+               (user.get('aiMatchingEnabled', true) is bool) &&
+               (user.get('autoDeleteMessages', false) is bool);
+      }
+    }
+
+    // --- CHATS ---
+    match /chats/{chatId} {
+      function isParticipant() {
+        return isSignedIn() && (request.auth.uid in resource.data.participants);
+      }
+
+      function isIncomingParticipant() {
+        return isSignedIn() && (request.auth.uid in incoming().participants);
+      }
+
+      allow get: if isParticipant();
+      allow list: if isSignedIn() && (request.auth.uid in resource.data.participants);
+      allow create: if isIncomingParticipant() && isValidChat(incoming());
+      allow update: if isParticipant() && isValidChat(incoming()) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['lastMessage', 'updatedAt'])
+      );
+
+      function isValidChat(chat) {
+        return chat.participants is list && chat.participants.size() == 2 &&
+               chat.participants.hasAll([request.auth.uid]);
+      }
+
+      // --- MESSAGES ---
+      match /messages/{messageId} {
+        allow read: if isSignedIn() && (
+          (exists(/databases/$(database)/documents/chats/$(chatId)) && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants) ||
+          (chatId.split('_').hasAll([request.auth.uid]))
+        );
+        
+        allow create: if isSignedIn() && 
+                      (incoming().senderId == request.auth.uid || incoming().senderId == 'SYSTEM') && 
+                      (
+                        (exists(/databases/$(database)/documents/chats/$(chatId)) && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants) ||
+                        (chatId.split('_').hasAll([request.auth.uid]))
+                      ) &&
+                      isValidMessage(incoming(), true);
+
+        allow update: if isSignedIn() && resource.data.senderId == request.auth.uid && 
+                      incoming().diff(existing()).affectedKeys().hasOnly(['text', 'updatedAt', 'isEdited']) &&
+                      isValidMessage(incoming(), false);
+
+        allow delete: if isSignedIn() && resource.data.senderId == request.auth.uid;
+        
+        function isValidMessage(msg, isCreate) {
+          return (msg.senderId is string && (msg.senderId == request.auth.uid || msg.senderId == 'SYSTEM')) &&
+                 msg.text is string && msg.text.size() <= 5000 &&
+                 (isCreate ? msg.createdAt == request.time : msg.updatedAt == request.time);
+        }
+      }
+    }
+
+    // --- REVIEWS ---
+    match /reviews/{reviewId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidReview(incoming());
+
+      function isValidReview(rev) {
+        return rev.reviewerId is string && rev.reviewerId == request.auth.uid &&
+               rev.rating is number && rev.rating >= 0 && rev.rating <= 5 &&
+               rev.comment is string && rev.comment.size() <= 1000 &&
+               rev.createdAt == request.time;
+      }
+    }
+
+    // --- AGREEMENTS ---
+    match /agreements/{agreementId} {
+      allow read: if isSignedIn() && request.auth.uid in resource.data.partnerIds;
+      allow create: if isSignedIn() && request.auth.uid in incoming().partnerIds && isValidAgreement(incoming()) && incoming().createdAt == request.time;
+      allow update: if isSignedIn() && request.auth.uid in existing().partnerIds && (
+        // Action: Sign or Update
+        (isValidAgreement(incoming()) && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['signedBy', 'status', 'agreementType', 'duration', 'expiresAt', 'updatedAt', 'description', 'items', 'totalAmount', 'id', 'partnerIds', 'partnerNames', 'createdAt', 'closingRequestedBy', 'willCloseAt'])) ||
+        // Action: Change Status (Close/Terminate)
+        (incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']) && 
+         incoming().status in ['terminated', 'closed', 'closing_pending'])
+      );
+      
+      allow delete: if isSignedIn() && request.auth.uid in resource.data.partnerIds && resource.data.status == 'pending';
+      
+      function isValidAgreement(agr) {
+        return agr.partnerIds is list && agr.partnerIds.size() == 2 &&
+               agr.signedBy is list && agr.signedBy.hasAny([request.auth.uid]) &&
+               agr.status in ['pending', 'signed', 'terminated', 'expired', 'closed', 'closing_pending'] &&
+               agr.agreementType in ['temporary', 'permanent'] &&
+               (agr.get('description', '') is string && agr.get('description', '').size() <= 5000) &&
+               (agr.get('items', []) is list) &&
+               (agr.get('totalAmount', 0) is number) &&
+               agr.updatedAt == request.time;
+      }
+    }
+
+    // --- NOTIFICATIONS ---
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() && request.auth.uid == resource.data.userId;
+      allow create: if isSignedIn(); 
+      allow update: if isSignedIn() && request.auth.uid == resource.data.userId &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['read']);
+      allow delete: if isSignedIn() && request.auth.uid == resource.data.userId;
+    }
+  }
+}
